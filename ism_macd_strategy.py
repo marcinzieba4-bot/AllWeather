@@ -361,6 +361,10 @@ START = "2000-01-01"
 END   = "2024-12-31"
 REBAL = "ME"
 
+# ── Momentum layer (fixed as per spec) ──
+SL_BARS      = 2   # consecutive monthly DAX closes DOWN  → stop loss
+REENTRY_BARS = 1   # consecutive monthly DAX closes UP after SL → re-entry
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 3.  DATA LOADING
 # ─────────────────────────────────────────────────────────────────────────────
@@ -392,57 +396,142 @@ def macd(series: pd.Series, fast: int, slow: int, sig: int):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5.  SIGNAL GENERATION
+# 5.  SIGNAL GENERATION  (two-layer: ISM regime  +  price momentum)
 # ─────────────────────────────────────────────────────────────────────────────
-def generate_raw_position(hist: np.ndarray,
-                           buy_lookback: int,
-                           sell_bars: int) -> np.ndarray:
-    """
-    State-machine on the MACD histogram array.
 
-    BUY  : first uptick (h[i] > h[i-1]) after buy_lookback consecutive
-           declining bars  (h[i-1] > h[i-2] > … > h[i-buy_lookback-1])
-    SELL : sell_bars consecutive declining bars
-           (h[i] < h[i-1] < … < h[i-sell_bars+1] < h[i-sell_bars])
+def ism_regime_raw(hist: np.ndarray,
+                   buy_lookback: int,
+                   sell_bars: int) -> np.ndarray:
+    """
+    LAYER 1 — ISM MACD regime gate  (0 = bear / 1 = bull).
+
+    ENTER regime : first MACD-histogram uptick after buy_lookback consecutive
+                   declining bars.
+    EXIT  regime : sell_bars consecutive declining histogram bars.
     """
     n = len(hist)
-    pos = np.zeros(n)
-    in_trade = False
+    regime = np.zeros(n)
+    in_regime = False
     start = max(sell_bars, buy_lookback) + 2
 
     for i in range(start, n):
         h = hist
-        if not in_trade:
-            # Need uptick at i AND buy_lookback declining bars before i
+        if not in_regime:
             uptick = h[i] > h[i - 1]
             if uptick and buy_lookback > 0:
-                prev_decline = all(h[i - 1 - k] < h[i - 2 - k]
-                                   for k in range(buy_lookback))
-                if prev_decline:
-                    in_trade = True
-                    pos[i] = 1
+                if all(h[i - 1 - k] < h[i - 2 - k] for k in range(buy_lookback)):
+                    in_regime = True
+                    regime[i] = 1
             elif uptick and buy_lookback == 0:
-                in_trade = True
-                pos[i] = 1
+                in_regime = True
+                regime[i] = 1
         else:
-            pos[i] = 1
-            # Check sell: sell_bars consecutive declines ending at i
-            falling = all(h[i - k] < h[i - k - 1]
-                          for k in range(sell_bars))
-            if falling:
-                in_trade = False
-                pos[i] = 0   # exit this bar
+            regime[i] = 1
+            if all(h[i - k] < h[i - k - 1] for k in range(sell_bars)):
+                in_regime = False
+                regime[i] = 0   # exit same bar
 
-    return pos
+    return regime
 
 
-def make_position(ism: pd.Series, fast: int, slow: int, sig: int,
-                  buy_lookback: int, sell_bars: int) -> pd.Series:
-    _, _, hist = macd(ism, fast, slow, sig)
-    raw = generate_raw_position(hist.values, buy_lookback, sell_bars)
-    pos = pd.Series(raw, index=ism.index, dtype=float)
-    # 1-month lag → position is set at month-end, executed the following month
-    return pos.shift(1).fillna(0)
+def apply_momentum_filter(regime_arr: np.ndarray,
+                           ret_arr: np.ndarray,
+                           sl_bars: int = 2) -> tuple:
+    """
+    LAYER 2 — Price-momentum SL + re-entry within the ISM bull regime.
+
+    Rules (all decisions set at month-end, executed 1 month later via lag):
+      • Enter long immediately when regime switches ON.
+      • STOP LOSS : sl_bars consecutive monthly DAX closes DOWN → exit.
+      • RE-ENTRY  : after SL, first positive monthly close → re-enter
+                    (provided we are still inside the bull regime).
+      • Regime turns OFF → force-exit regardless of price momentum.
+
+    Returns
+    -------
+    pos : np.ndarray   final position (0/1)
+    why : np.ndarray   exit reason   (0=none, 1=ISM regime off, 2=momentum SL)
+    """
+    n = len(regime_arr)
+    pos = np.zeros(n)
+    why = np.zeros(n, dtype=int)
+
+    prev_regime = 0
+    in_trade    = False
+    sl_active   = False
+
+    for i in range(sl_bars + 1, n):
+        reg = regime_arr[i]
+
+        if reg == 0:
+            # ── Regime OFF ────────────────────────────────────────────────
+            if in_trade:
+                why[i] = 1        # ISM MACD forced exit
+            in_trade   = False
+            sl_active  = False
+            prev_regime = 0
+            pos[i]     = 0
+
+        else:
+            # ── Regime ON ────────────────────────────────────────────────
+            if prev_regime == 0:
+                # Fresh regime entry → enter long immediately
+                in_trade  = True
+                sl_active = False
+
+            prev_regime = 1
+
+            if in_trade:
+                # Check momentum SL: last sl_bars returns all negative
+                # (ret[i] and ret[i-1] are both observable at end of month i)
+                consec_down = all(ret_arr[i - k] < 0 for k in range(sl_bars))
+                if consec_down:
+                    in_trade  = False
+                    sl_active = True
+                    why[i]    = 2    # momentum SL
+                    pos[i]    = 0
+                else:
+                    pos[i] = 1
+            else:
+                # SL active — wait for 1 positive monthly close to re-enter
+                if sl_active and ret_arr[i] > 0:
+                    in_trade  = True
+                    sl_active = False
+                    pos[i]    = 1
+                else:
+                    pos[i] = 0
+
+    return pos, why
+
+
+def make_combined_position(ism: pd.Series,
+                            dax_ret: pd.Series,
+                            fast: int, slow: int, sig: int,
+                            buy_lookback: int, sell_bars: int) -> tuple:
+    """
+    Combine ISM regime + momentum filter, then apply 1-month execution lag.
+
+    Returns (position_series, exit_why_series, ism_regime_series).
+    """
+    _, _, hist_s = macd(ism, fast, slow, sig)
+    hist_arr = hist_s.values
+
+    # Align ISM and DAX on common dates
+    common  = ism.index.intersection(dax_ret.dropna().index)
+    hist_a  = hist_s.reindex(common).values
+    ret_a   = dax_ret.reindex(common).values
+
+    regime_a             = ism_regime_raw(hist_a, buy_lookback, sell_bars)
+    pos_a, why_a         = apply_momentum_filter(regime_a, ret_a, sl_bars=SL_BARS)
+
+    regime_s = pd.Series(regime_a, index=common, dtype=float)
+    pos_s    = pd.Series(pos_a,    index=common, dtype=float)
+    why_s    = pd.Series(why_a,    index=common, dtype=int)
+
+    # 1-month lag: decision made at month-end, executed following month
+    return (pos_s.shift(1).fillna(0),
+            why_s.shift(1).fillna(0).astype(int),
+            regime_s.shift(1).fillna(0))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -497,12 +586,13 @@ def optimise(ism: pd.Series, dax_ret: pd.Series) -> pd.DataFrame:
               for sv in SELL_VALS
               if f < s]                    # constraint: fast < slow
 
-    print(f"  Grid search: {len(combos)} parameter combinations …")
+    print(f"  Grid search: {len(combos)} combos  "
+          f"[ISM regime + momentum SL={SL_BARS}m / re-entry={REENTRY_BARS}m] …")
 
     for fast, slow, sig, buy_lb, sell_b in combos:
-        pos = make_position(ism, fast, slow, sig, buy_lb, sell_b)
+        pos, _, _ = make_combined_position(ism, dax_ret, fast, slow, sig, buy_lb, sell_b)
         # Align on common index
-        common = pos.index.intersection(dax_ret.index)
+        common = pos.index.intersection(dax_ret.dropna().index)
         pos_c  = pos.reindex(common)
         ret_c  = dax_ret.reindex(common)
 
@@ -537,17 +627,24 @@ def run_backtest(ism: pd.Series, dax: pd.Series,
                  fast: int, slow: int, sig: int,
                  buy_lb: int, sell_b: int):
 
-    pos = make_position(ism, fast, slow, sig, buy_lb, sell_b)
+    dax_ret = dax.pct_change()
+    pos, why, regime = make_combined_position(
+        ism, dax_ret, fast, slow, sig, buy_lb, sell_b)
+
     common = pos.index.intersection(dax.dropna().index)
     pos    = pos.reindex(common)
+    why    = why.reindex(common)
+    regime = regime.reindex(common)
     dax_c  = dax.reindex(common)
 
     res = pd.DataFrame(index=common)
-    res["dax_ret"]   = dax_c.pct_change()
-    res["position"]  = pos
-    res["strat_ret"] = pos * res["dax_ret"]
-    res["dax_cum"]   = (1 + res["dax_ret"]).cumprod()
-    res["strat_cum"] = (1 + res["strat_ret"]).cumprod()
+    res["dax_ret"]    = dax_c.pct_change()
+    res["position"]   = pos
+    res["ism_regime"] = regime
+    res["exit_why"]   = why      # 1=ISM exit, 2=momentum SL
+    res["strat_ret"]  = pos * res["dax_ret"]
+    res["dax_cum"]    = (1 + res["dax_ret"]).cumprod()
+    res["strat_cum"]  = (1 + res["strat_ret"]).cumprod()
 
     _, _, hist_s = macd(ism, fast, slow, sig)
     res["macd_hist"] = hist_s.reindex(common)
@@ -555,8 +652,12 @@ def run_backtest(ism: pd.Series, dax: pd.Series,
     return res
 
 
+EXIT_LABELS = {0: "—", 1: "ISM regime OFF", 2: "Momentum SL ✂"}
+
+
 def extract_trades(res: pd.DataFrame, dax: pd.Series) -> pd.DataFrame:
     pos = res["position"]
+    why = res["exit_why"]
     trades, in_trade = [], False
     entry_date = entry_px = None
 
@@ -565,15 +666,17 @@ def extract_trades(res: pd.DataFrame, dax: pd.Series) -> pd.DataFrame:
             in_trade, entry_date = True, date
             entry_px = dax.get(date, np.nan)
         elif in_trade and p == 0:
-            exit_px = dax.get(date, np.nan)
-            pct = (exit_px / entry_px - 1) * 100 if entry_px and not np.isnan(entry_px) else np.nan
+            exit_px   = dax.get(date, np.nan)
+            pct       = (exit_px / entry_px - 1) * 100 if entry_px and not np.isnan(entry_px) else np.nan
+            exit_code = int(why.get(date, 0))
             trades.append({
-                "Entry Date":      entry_date.strftime("%Y-%m-%d"),
-                "Exit Date":       date.strftime("%Y-%m-%d"),
-                "Entry DAX":       round(entry_px, 0),
-                "Exit DAX":        round(exit_px, 0),
-                "Return (%)":      round(pct, 2),
-                "Duration (mo)":   round((date - entry_date).days / 30.44, 1),
+                "Entry Date":    entry_date.strftime("%Y-%m-%d"),
+                "Exit Date":     date.strftime("%Y-%m-%d"),
+                "Entry DAX":     round(entry_px, 0),
+                "Exit DAX":      round(exit_px, 0),
+                "Return (%)":    round(pct, 2),
+                "Duration (mo)": round((date - entry_date).days / 30.44, 1),
+                "Exit Reason":   EXIT_LABELS.get(exit_code, str(exit_code)),
             })
             in_trade = False
 
@@ -582,12 +685,13 @@ def extract_trades(res: pd.DataFrame, dax: pd.Series) -> pd.DataFrame:
         exit_px   = dax.get(last_date, np.nan)
         pct = (exit_px / entry_px - 1) * 100 if entry_px and not np.isnan(entry_px) else np.nan
         trades.append({
-            "Entry Date":  entry_date.strftime("%Y-%m-%d"),
-            "Exit Date":   last_date.strftime("%Y-%m-%d") + " *open*",
-            "Entry DAX":   round(entry_px, 0),
-            "Exit DAX":    round(exit_px, 0),
-            "Return (%)":  round(pct, 2),
+            "Entry Date":    entry_date.strftime("%Y-%m-%d"),
+            "Exit Date":     last_date.strftime("%Y-%m-%d") + " *open*",
+            "Entry DAX":     round(entry_px, 0),
+            "Exit DAX":      round(exit_px, 0),
+            "Return (%)":    round(pct, 2),
             "Duration (mo)": round((last_date - entry_date).days / 30.44, 1),
+            "Exit Reason":   "still open",
         })
     return pd.DataFrame(trades)
 
@@ -629,9 +733,10 @@ def plot_results(ism, res, trades, ann, params):
                         alpha=0.08, color=GREEN, linewidth=0)
 
     ax1.set_title(
-        f"ISM Manufacturing MACD — DAX Switching Strategy\n"
-        f"MACD({fast},{slow},{sig})  |  Buy after {buy_lb} declining bars + uptick  |  Sell after {sell_b} consecutive declines",
-        fontsize=13, fontweight="bold"
+        f"ISM MACD Regime  +  Momentum SL ({SL_BARS}m) / Re-entry ({REENTRY_BARS}m)  —  DAX\n"
+        f"MACD({fast},{slow},{sig})  |  Regime buy: {buy_lb} declining bars + uptick  "
+        f"|  Regime sell: {sell_b} consecutive declines",
+        fontsize=12, fontweight="bold"
     )
     ax1.set_ylabel("Portfolio Value (base = 1.0)")
     ax1.legend(fontsize=11)
@@ -648,10 +753,17 @@ def plot_results(ism, res, trades, ann, params):
     ax2.legend(fontsize=10)
     ax2.grid(True, alpha=0.25)
 
-    # ── Chart 3 : ISM PMI + MACD ──────────────────────────────────────────
+    # ── Chart 3 : ISM PMI + MACD with regime & SL events ─────────────────
     ax3_r = ax3.twinx()
-    ism_plot = ism.reindex(res.index)
+    ism_plot  = ism.reindex(res.index)
     hist_plot = res["macd_hist"]
+    regime    = res.get("ism_regime", pd.Series(0, index=res.index))
+
+    # ISM regime band (light blue = regime ON)
+    for i in range(len(regime) - 1):
+        if regime.iloc[i] == 1:
+            ax3.axvspan(regime.index[i], regime.index[i + 1],
+                        alpha=0.10, color=BLUE, linewidth=0)
 
     ax3.plot(res.index, ism_plot, color=ORG, lw=1.8, label="ISM PMI", alpha=0.9)
     ax3.axhline(50, color=ORG, ls="--", lw=1.2, alpha=0.6)
@@ -665,32 +777,56 @@ def plot_results(ism, res, trades, ann, params):
     ax3_r.set_ylabel("MACD Histogram", color="grey")
     ax3_r.axhline(0, color="black", lw=0.8)
 
-    # Mark buy/sell points on histogram
-    buy_dates  = [trades.loc[i, "Entry Date"] for i in trades.index
-                  if "*open*" not in str(trades.loc[i, "Exit Date"])]
-    sell_dates = [trades.loc[i, "Exit Date"]  for i in trades.index
-                  if "*open*" not in str(trades.loc[i, "Exit Date"])]
-    for d in buy_dates:
+    # Entry markers (▲ green) and exit markers split by reason
+    ism_exits = trades[trades.get("Exit Reason", pd.Series()).str.contains("ISM", na=False)]
+    sl_exits  = trades[trades.get("Exit Reason", pd.Series()).str.contains("SL",  na=False)]
+    entries   = trades[~trades["Exit Date"].str.contains("open")]
+
+    for d in entries["Entry Date"]:
         try:
             dt = pd.Timestamp(d)
             if dt in hist_plot.index:
                 ax3_r.scatter(dt, hist_plot.loc[dt], marker="^",
-                              color=GREEN, s=80, zorder=5)
+                              color=GREEN, s=90, zorder=6)
         except Exception:
             pass
-    for d in sell_dates:
+    for d in ism_exits["Exit Date"]:
         try:
             dt = pd.Timestamp(d)
             if dt in hist_plot.index:
                 ax3_r.scatter(dt, hist_plot.loc[dt], marker="v",
-                              color=RED, s=80, zorder=5)
+                              color=RED, s=90, zorder=6, label="_ism_exit")
+        except Exception:
+            pass
+    for d in sl_exits["Exit Date"]:
+        try:
+            dt = pd.Timestamp(d)
+            if dt in hist_plot.index:
+                ax3_r.scatter(dt, hist_plot.loc[dt], marker="x",
+                              color="#e74c3c", s=130, linewidths=2.5,
+                              zorder=6, label="_sl_exit")
         except Exception:
             pass
 
-    ax3.set_title(f"ISM PMI & MACD Histogram  (▲ = buy signal, ▼ = sell signal)", fontsize=12)
+    # Legend patches
+    import matplotlib.patches as mpatches
+    import matplotlib.lines as mlines
+    regime_patch = mpatches.Patch(color=BLUE,  alpha=0.3,  label="ISM regime ON")
+    entry_dot    = mlines.Line2D([], [], color=GREEN, marker="^", ls="None",
+                                 ms=8, label="Entry")
+    ism_dot      = mlines.Line2D([], [], color=RED,   marker="v", ls="None",
+                                 ms=8, label="Exit: ISM regime OFF")
+    sl_dot       = mlines.Line2D([], [], color="#e74c3c", marker="x", ls="None",
+                                 ms=9, mew=2.5, label="Exit: Momentum SL")
+
+    ax3.set_title("ISM PMI & MACD  │  Blue band = regime ON  │  ▲=entry  ▼=ISM exit  ✕=momentum SL",
+                  fontsize=11)
     lines1, lbl1 = ax3.get_legend_handles_labels()
     lines2, lbl2 = ax3_r.get_legend_handles_labels()
-    ax3.legend(lines1 + lines2, lbl1 + lbl2, fontsize=9, loc="upper left")
+    ax3.legend(lines1 + lines2 + [regime_patch, entry_dot, ism_dot, sl_dot],
+               lbl1  + lbl2  + [regime_patch.get_label(), entry_dot.get_label(),
+                                 ism_dot.get_label(), sl_dot.get_label()],
+               fontsize=8, loc="upper left", ncol=2)
     ax3.grid(True, alpha=0.2)
 
     # ── Chart 4 : Annual Returns bar ──────────────────────────────────────
@@ -706,22 +842,34 @@ def plot_results(ism, res, trades, ann, params):
     ax4.legend(fontsize=10)
     ax4.grid(True, alpha=0.25, axis="y")
 
-    # ── Chart 5 : Trade returns bar chart ────────────────────────────────
+    # ── Chart 5 : Trade returns, coloured by exit reason ──────────────────
     completed = trades[~trades["Exit Date"].str.contains("open")].copy()
     if not completed.empty:
-        t_colors = [GREEN if r > 0 else RED for r in completed["Return (%)"].values]
+        # Green=win-ISM, lime=win-SL, red=loss-ISM, coral=loss-SL
+        def _bar_color(row):
+            is_sl  = "SL" in str(row.get("Exit Reason", ""))
+            is_win = row["Return (%)"] > 0
+            if is_win  and not is_sl: return GREEN
+            if is_win  and is_sl:     return "#2ecc71"
+            if not is_win and is_sl:  return "#e74c3c"
+            return RED
+
+        t_colors = [_bar_color(r) for _, r in completed.iterrows()]
         ax5.bar(range(len(completed)), completed["Return (%)"].values,
-                color=t_colors, alpha=0.75, edgecolor="white", linewidth=0.5)
+                color=t_colors, alpha=0.82, edgecolor="white", linewidth=0.4)
         ax5.axhline(0, color="black", lw=0.8)
         ax5.set_xticks(range(len(completed)))
         ax5.set_xticklabels(
             [f"{r['Entry Date'][:7]}" for _, r in completed.iterrows()],
-            rotation=45, fontsize=8
+            rotation=45, fontsize=7
         )
+        n_sl   = (completed["Exit Reason"].str.contains("SL",  na=False)).sum()
+        n_ism  = (completed["Exit Reason"].str.contains("ISM", na=False)).sum()
+        wr     = (completed["Return (%)"] > 0).mean() * 100
         ax5.set_title(
-            f"Individual Trade Returns  ({len(completed)} completed trades | "
-            f"Win rate: {(completed['Return (%)'] > 0).mean() * 100:.1f}%)",
-            fontsize=12
+            f"Individual Trade Returns  ({len(completed)} trades | win {wr:.0f}% | "
+            f"ISM exits: {n_ism}  Momentum SL exits: {n_sl})",
+            fontsize=11
         )
         ax5.set_ylabel("Return (%)")
         ax5.grid(True, alpha=0.25, axis="y")
@@ -746,9 +894,12 @@ def main():
 
     print()
     print(SEP2)
-    print("   ISM MANUFACTURING MACD — DAX SWITCHING STRATEGY")
+    print("   ISM MACD REGIME  +  MOMENTUM SL/RE-ENTRY  —  DAX SWITCHING")
     print(SEP2)
-    print(f"   Period: {START} → {END}   |   Rebalancing: monthly   |   Lag: 1 month")
+    print(f"   Period : {START} → {END}   |   Rebalancing: monthly   |   Lag: 1 month")
+    print(f"   Layer 1: ISM MACD regime gate  (bull/bear)")
+    print(f"   Layer 2: price momentum  —  SL after {SL_BARS} consecutive down months,")
+    print(f"            re-entry after {REENTRY_BARS} positive month within regime")
     print()
 
     # ── Load data ──────────────────────────────────────────────────────────
@@ -793,7 +944,8 @@ def main():
     print()
     print(SEP)
     print(f"  BEST PARAMETERS  →  MACD({fast},{slow},{sig})"
-          f"  buy_lookback={buy_lb}  sell_bars={sell_b}")
+          f"  regime_buy_lookback={buy_lb}  regime_sell_bars={sell_b}"
+          f"  │  momentum_sl={SL_BARS}m  reentry={REENTRY_BARS}m  (fixed)")
     print(SEP)
 
     # ── Full backtest with best params ────────────────────────────────────
