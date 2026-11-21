@@ -222,7 +222,7 @@ def main():
         ax[0].plot(idx, c, color=col, lw=lw, label=name)
         ax[1].plot(idx, (c / np.maximum.accumulate(c) - 1) * 100, color=col, lw=1.1)
     ax[0].axvline(pd.Timestamp(SPLIT), color="black", ls="--", lw=1)
-    ax[0].text(pd.Timestamp(SPLIT), 0.98, "  test period (not used for selection) →", transform=ax[0].get_xaxis_transform(),
+    ax[0].text(pd.Timestamp(SPLIT), 0.98, "  second half (2012 onward) →", transform=ax[0].get_xaxis_transform(),
                va="top", fontsize=9)
     ax[1].axvline(pd.Timestamp(SPLIT), color="black", ls="--", lw=1)
     ax[0].set_yscale("log"); ax[0].set_ylabel("Growth of 1 (log)"); ax[1].set_ylabel("Drawdown %")
