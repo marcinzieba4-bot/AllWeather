@@ -36,8 +36,9 @@ BORROW_SPREAD = 0.005      # financing spread over cash for the leveraged varian
 
 
 class Lab:
-    def __init__(self):
-        self.e = e = Engine(load_zew(), load_dax())
+    def __init__(self, zew=None, px=None):
+        self.e = e = Engine(load_zew() if zew is None else zew,
+                            load_dax() if px is None else px)
         self.idx, self.n, self.px = e.idx, e.n, e.px
         rf = pd.read_csv(RATE_FILE, index_col=0, parse_dates=True).iloc[:, 0] / 100
         rf.index = rf.index + pd.offsets.MonthBegin(1)        # known one month later
