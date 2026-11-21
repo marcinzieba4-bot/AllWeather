@@ -39,6 +39,21 @@ from zew_surprise_strategy import load_zew, load_dax, COST, HERE
 START, SPLIT = "1997-09-01", "2012-01-01"
 
 
+def macd_rising(px, freq):
+    per = px.index.to_period(freq)
+    c = px.groupby(per).last()
+    line = c.ewm(span=12, adjust=False).mean() - c.ewm(span=26, adjust=False).mean()
+    up = line.diff() > 0
+    end = np.append(per[1:] != per[:-1], True)
+    out, cur = np.zeros(len(px), bool), False
+    for i in range(len(px)):
+        if end[i]:
+            cur = bool(up.loc[per[i]])
+        out[i] = cur
+    return out
+
+
+
 def build():
     zew = load_zew()
     dax_full, bund = load_dax(), zb.load_bund()
@@ -51,19 +66,6 @@ def build():
 
     def al(arr, src_idx):                            # align a daily array to idx
         return pd.Series(np.asarray(arr, float), index=src_idx).reindex(idx, method="ffill").fillna(0).values > 0
-
-    def macd_rising(px, freq):
-        per = px.index.to_period(freq)
-        c = px.groupby(per).last()
-        line = c.ewm(span=12, adjust=False).mean() - c.ewm(span=26, adjust=False).mean()
-        up = line.diff() > 0
-        end = np.append(per[1:] != per[:-1], True)
-        out, cur = np.zeros(len(px), bool), False
-        for i in range(len(px)):
-            if end[i]:
-                cur = bool(up.loc[per[i]])
-            out[i] = cur
-        return out
 
     Z = {k: al(LDf.regime(k), LDf.idx) for k in ["above_zero", "cross", "surprise", "cross_or_surprise"]}
     M = {"macd_M": al(macd_rising(dax_full, "M"), dax_full.index),
